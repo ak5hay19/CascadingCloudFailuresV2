@@ -1,3 +1,4 @@
 borg_traces_data.csv
 *.pyc
 /.venv
+/processed
