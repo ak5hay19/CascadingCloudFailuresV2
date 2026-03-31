@@ -1,5 +1,6 @@
 # ============================================================
-# Configuration — Optimized for RTX 4060 Mobile (8GB VRAM)
+# Configuration — GraphSAGE on Full Graph
+# RTX 4060 Mobile (8GB VRAM) / 16GB RAM
 # ============================================================
 
 data:
@@ -7,20 +8,21 @@ data:
   time_window_sec: 300          # 5-minute buckets
   prediction_horizon: 3         # predict 15 min ahead
   sequence_length: 6            # 30 min of history
-  max_nodes: 500                # subsample for GPU fit
+  max_nodes: null               # null = use ALL nodes (no subsampling)
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
 
 model:
-  hidden_dim: 48                # sweet spot: expressive but small
-  num_gnn_layers: 2             # 2-layer GCN for 2-hop neighborhoods
+  hidden_dim: 48
+  num_gnn_layers: 2             # 2-layer GraphSAGE for 2-hop neighborhoods
   dropout: 0.3
-  use_edge_weight: true         # weighted edges (cluster vs collection)
+  num_neighbors: 15             # sample 15 neighbors per node per layer
+  use_edge_weight: true
 
 training:
   epochs: 30
-  batch_size: 8                 # mini-batch sequences to control VRAM
+  batch_size: 8                 # gradient accumulation over 8 sequences
   learning_rate: 0.001
   weight_decay: 0.0001
   early_stopping_patience: 10
