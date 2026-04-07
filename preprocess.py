@@ -224,7 +224,7 @@ def build_adjacency(df, max_nodes=3000):
     print("Building adjacency graph...")
 
     machines = df["machine_id"].unique()
-    if len(machines) > max_nodes:
+    if max_nodes and len(machines) > max_nodes:
         print(f"  Subsampling {len(machines)} → {max_nodes} machines (by activity)")
         top = df["machine_id"].value_counts().head(max_nodes).index
         machines = top.values
