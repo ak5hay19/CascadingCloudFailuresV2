@@ -1,34 +1,32 @@
 # ============================================================
-# Configuration — GraphSAGE on Full Graph
-# RTX 4060 Mobile (8GB VRAM) / 16GB RAM
+# Configuration — Dynamic GraphSAGE on Full Borg Trace
+# RTX 4060 Mobile (8GB VRAM) / 16GB RAM / Ryzen 9 8945HS
 # ============================================================
 
 data:
-  filename: "borg_traces_data.csv"
+  filename: "borg_traces_half.csv"
   time_window_sec: 300          # 5-minute buckets
   prediction_horizon: 3         # predict 15 min ahead
-  sequence_length: 6            # 30 min of history
-  max_nodes: null               # null = use ALL nodes (no subsampling)
-  train_ratio: 0.7
-  val_ratio: 0.15
-  test_ratio: 0.15
+  sequence_length: 8            # 40 min of history
+  train_ratio: 0.4              # orignal was 0.7 
+  val_ratio: 0.1                # og both were 0.15
+  test_ratio: 0.1
 
 model:
-  hidden_dim: 48
+  hidden_dim: 32
   num_gnn_layers: 2             # 2-layer GraphSAGE for 2-hop neighborhoods
   dropout: 0.3
   num_neighbors: 15             # sample 15 neighbors per node per layer
-  use_edge_weight: true
 
 training:
-  epochs: 30
-  batch_size: 8                 # gradient accumulation over 8 sequences
+  epochs: 15                   # og 30 epochs
+  batch_size: 2               # og 8 batches
   learning_rate: 0.001
   weight_decay: 0.0001
   early_stopping_patience: 10
   gradient_clip: 1.0
-  focal_alpha: 0.75
-  focal_gamma: 2.0
+  focal_alpha: 0.99
+  focal_gamma: 3.0
 
 evaluate:
   top_k_critical: 20
