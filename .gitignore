@@ -3,3 +3,4 @@ borg_traces_data.csv
 /.venv
 /processed
 borg_traces_half.csv
+best_model.pt
