@@ -1,32 +1,26 @@
 """
 Spatio-Temporal Graph Neural Network (Dynamic)
 ================================================
-Architecture: 2-layer GraphSAGE (spatial) → GRU (temporal) → MLP (classifier)
+Architecture: 2-layer GraphSAGE (spatial) -> GRU (temporal) -> MLP (classifier)
 
 KEY NOVELTY: Dynamic graph topology.
   - Static ST-GNNs use the same edge_index for every timestep.
   - Our model accepts a DIFFERENT edge_index per timestep, reflecting
     which machines are actually co-located in the same cluster/collection
     during that specific 5-minute window.
-  - This captures real topology evolution: machines join/leave collections
-    as jobs start/finish, cluster membership changes with reassignment.
 
-Why GraphSAGE?
-  - Neighbor sampling (via edge dropout) keeps VRAM bounded
-  - Full graph (~4,900 nodes) without subsampling
-  - Edge dropout during training = graph-structure regularization
+Hardware target: RTX 4060 Mobile 8GB VRAM
+  - hidden_dim=32 (HARD LIMIT — 48 causes OOM)
+  - batch_size=2  (HARD LIMIT — higher causes OOM)
+  - Full AMP (torch.amp) compatibility for fp16 forward passes
+  - Edge dropout via PyG's C++ backend (no Python overhead)
 
-FIX LOG (memory & performance):
-  - Replaced pure-Python sample_neighbors() with torch_geometric.utils.dropout_edge
-    → eliminates CPU↔GPU round-trips, Python adjacency lists, and per-call allocations
-  - Added edge_drop_rate parameter (default 0.3) to control graph regularization
-  - Removed num_neighbors parameter (no longer needed with edge dropout)
-  - dropout_edge runs in PyG's C++ backend on GPU — zero Python overhead
-  - Added temporal attention pooling over all GRU outputs (replaces last-step-only)
-    → model attends to the most predictive window; early cascade signals no longer lost
-  - Switched FocalLoss to sigmoid-based (Lin et al. 2017): correct for binary node
-    classification; softmax coupled the two class probabilities, which is incorrect
-    because a node's failure probability is independent of its normal probability
+FIX LOG:
+  - Replaced sample_neighbors() with dropout_edge (100x faster, GPU-native)
+  - Added temporal attention pooling (replaces last-step-only GRU readout)
+  - Sigmoid-based Focal Loss (Lin et al. 2017) for binary node classification
+  - focal_alpha=0.99, focal_gamma=3.0 for extreme class imbalance (~0.0001)
+  - All operations AMP-safe: no manual float16 casts, LayerNorm in float32
 """
 
 import torch
@@ -40,9 +34,11 @@ class SpatialEncoder(nn.Module):
     """
     2-layer GraphSAGE with residual connections.
 
-    Layer 1: node sees its direct neighbors — 1-hop
-    Layer 2: node sees neighbors-of-neighbors — 2-hop
+    Layer 1: 1-hop (direct neighbors)
+    Layer 2: 2-hop (neighbors-of-neighbors) — needed for cascade detection
     Residual: preserves the node's own features through aggregation
+
+    AMP-safe: LayerNorm auto-casts to float32 internally.
     """
 
     def __init__(self, in_dim, hidden_dim, num_layers=2, dropout=0.3):
@@ -77,22 +73,21 @@ class SpatioTemporalGNN(nn.Module):
 
     For each timestep t:
       1. Get edge_index_t (dynamic — different graph structure per window)
-      2. If training: randomly drop edges via dropout_edge (graph regularizer)
-      3. h_t = GraphSAGE(x_t, edges_t)              → [N, hidden]
+      2. If training: randomly drop edges via dropout_edge (regularizer)
+      3. h_t = GraphSAGE(x_t, edges_t)              -> [N, hidden]
 
-    Stack:  H = [h_1, ..., h_T]                      → [N, T, hidden]
-    GRU:    z = GRU(H)[:, -1, :]                      → [N, hidden]
-    MLP:    logits = classifier(z)                     → [N, 2]
+    Stack:  H = [h_1, ..., h_T]                      -> [N, T, hidden]
+    GRU:    gru_out = GRU(H)                          -> [N, T, hidden]
+    Attn:   z = attention_pool(gru_out)               -> [N, hidden]
+    MLP:    logits = classifier(z)                    -> [N, 2]
 
     The key difference from static ST-GNNs: edge_index can be a LIST
     of per-timestep edge tensors, not just one shared tensor.
-    If a single tensor is passed, it's reused for all timesteps (backward compatible).
     """
 
-    def __init__(self, input_dim, hidden_dim=48, num_classes=2,
+    def __init__(self, input_dim, hidden_dim=32, num_classes=2,
                  num_gnn_layers=2, dropout=0.3, edge_drop_rate=0.3,
-                 # Keep num_neighbors for backward compat with saved checkpoints
-                 num_neighbors=None):
+                 num_neighbors=None):  # kept for checkpoint compat
         super().__init__()
         self.spatial = SpatialEncoder(input_dim, hidden_dim, num_gnn_layers, dropout)
         self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
@@ -104,10 +99,10 @@ class SpatioTemporalGNN(nn.Module):
         )
         self.hidden_dim = hidden_dim
         self.edge_drop_rate = edge_drop_rate
-        # Temporal attention: learns which timestep carries the most failure signal.
-        # Replaces the naive "always use the last GRU output" assumption — a machine
-        # degrading sharply at t-3 is a stronger cascade indicator than its stable
-        # readings at t-1, and attention lets the model discover that automatically.
+
+        # Temporal attention: learns which timestep carries most failure signal.
+        # A machine degrading sharply at t-3 is a stronger cascade indicator
+        # than its stable readings at t-1; attention discovers this automatically.
         self.attn = nn.Linear(hidden_dim, 1)
 
     def forward(self, x_seq, edge_index, num_nodes=None, return_embeddings=False):
@@ -121,34 +116,29 @@ class SpatioTemporalGNN(nn.Module):
         """
         # Handle both static and dynamic edge_index
         if isinstance(edge_index, list):
-            edge_list = edge_index  # one per timestep
+            edge_list = edge_index
         else:
-            edge_list = [edge_index] * len(x_seq)  # reuse static for all
+            edge_list = [edge_index] * len(x_seq)
 
         # Spatial encoding per timestep with per-timestep edges
         spatial_out = []
         for t, x_t in enumerate(x_seq):
             ei_t = edge_list[t]
 
-            # Edge dropout during training: PyG's C++ backend, no Python loops
-            # This replaces the old sample_neighbors() function entirely.
-            # dropout_edge randomly removes edges, achieving the same
-            # regularization as neighbor sampling but ~100x faster.
+            # Edge dropout during training: PyG's C++ backend, zero Python overhead.
+            # Achieves same regularization as neighbor sampling but ~100x faster.
             if self.training and self.edge_drop_rate > 0:
-                ei_t, _ = dropout_edge(ei_t, p=self.edge_drop_rate,
-                                       training=True)
+                ei_t, _ = dropout_edge(ei_t, p=self.edge_drop_rate, training=True)
 
             h_t = self.spatial(x_t, ei_t)
             spatial_out.append(h_t)
 
-        # Stack → [N, T, hidden]
+        # Stack -> [N, T, hidden]
         H = torch.stack(spatial_out, dim=1)
 
         # Temporal GRU + attention pooling over all timesteps.
-        # A single last-step readout discards intermediate windows — e.g., a resource
-        # spike at t-4 that precedes a cascade is as important as the final window.
-        # Attention weights (softmax over T) let the model learn which window to focus
-        # on, keeping the full sequence history while remaining compute-efficient.
+        # Attention lets the model learn which window to focus on,
+        # keeping the full sequence history while staying compute-efficient.
         gru_out, _ = self.gru(H)                              # [N, T, hidden]
         attn_w = torch.softmax(self.attn(gru_out), dim=1)     # [N, T, 1]
         z = (gru_out * attn_w).sum(dim=1)                     # [N, hidden]
@@ -163,32 +153,52 @@ class SpatioTemporalGNN(nn.Module):
 
 class FocalLoss(nn.Module):
     """
-    Sigmoid-based Focal Loss for imbalanced binary node classification (Lin et al. 2017).
+    Sigmoid-based Focal Loss for imbalanced binary node classification.
+    (Lin et al. 2017, adapted for extreme class imbalance)
 
-    alpha: weight for the failing class — computed dynamically from training class
-           distribution so it reflects actual failure rarity in the Borg traces
-    gamma=2.0: down-weights easy predictions, forcing the model to focus on the hard
-               cases (nodes on the boundary between normal and cascading failure)
+    Default: alpha=0.99, gamma=3.0 — tuned for ~0.0001 failure rate in Borg traces.
+
+    Why these values?
+      alpha=0.99: gives 99x weight to the failing class vs normal. With ~0.01%
+                  failure rate, this is necessary to prevent the model from
+                  trivially predicting all-normal (which gives 99.99% accuracy
+                  but 0.0 F1 on the failing class).
+      gamma=3.0:  aggressively down-weights easy negatives. gamma=2.0 is standard
+                  for ~20% imbalance; at ~0.01% imbalance, gamma=3.0 provides
+                  stronger focus on the hard boundary cases.
 
     Why sigmoid, not softmax?
-      Softmax treats the two classes as competitors (p_fail + p_normal = 1), which
-      couples the predictions. For node-level failure detection, whether a server is
-      failing is independent of how "normal" it looks — sigmoid respects this.
+      Softmax couples p_fail + p_normal = 1. For node-level failure detection,
+      whether a server is failing is independent of how "normal" it looks.
+      Sigmoid respects this independence.
+
+    AMP-safe: clamp operations use float32 for numerical stability.
     """
 
-    def __init__(self, alpha=0.75, gamma=2.0):
+    def __init__(self, alpha=0.99, gamma=3.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
     def forward(self, logits, targets):
+        # Compute in float32 for numerical stability under AMP
+        logits_f = logits.float()
+
         # p: predicted probability of being in the failing class
-        p = torch.sigmoid(logits[:, 1])
+        p = torch.sigmoid(logits_f[:, 1])
+
         # pt: probability assigned to the TRUE class for each node
         pt = torch.where(targets == 1, p, 1 - p)
+
         # alpha_t: class-specific focal weight
-        alpha_t = torch.where(targets == 1,
-                              torch.full_like(p, self.alpha),
-                              torch.full_like(p, 1 - self.alpha))
-        loss = -alpha_t * ((1 - pt) ** self.gamma) * torch.log(pt.clamp(1e-7, 1.0))
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(p, self.alpha),
+            torch.full_like(p, 1 - self.alpha),
+        )
+
+        # Focal loss: -alpha_t * (1 - pt)^gamma * log(pt)
+        # clamp pt to avoid log(0) and numerical underflow
+        loss = -alpha_t * ((1 - pt) ** self.gamma) * torch.log(pt.clamp(min=1e-7, max=1.0))
+
         return loss.mean()

@@ -3,41 +3,33 @@ STEP 2: Train the Dynamic Spatio-Temporal GNN
 ================================================
     python train.py
 
-[REDESIGNED for GPU saturation — multi-process DataLoader + true mini-batching]
+Windows 11 Native (PowerShell) — RTX 4060 Mobile 8GB / 16GB RAM
 
-Architecture: 2-layer GraphSAGE (spatial) -> GRU (temporal) -> MLP (classifier)
-Dynamic edges: per-window topology pre-computed at init time, not during training.
+CRITICAL CONSTRAINTS (from CLAUDE.md):
+  - batch_size: 2     (HARD LIMIT — higher causes OOM on 8GB VRAM)
+  - hidden_dim: 32    (HARD LIMIT — 48 causes OOM)
+  - num_workers: 0    (HARD LIMIT — >1 causes Error 1455 on Windows)
+  - epochs: 10        (fits 30-60 minute training window)
+  - NO torch.compile  (Triton not supported on Windows)
+  - Modern torch.amp  (not deprecated torch.cuda.amp)
 
 Pipeline:
-  1. PRE-COMPUTE at init: features and labels stored in SPARSE PACKED format
-     (only active entries, no zero-padding). Edge indices pre-computed.
-  2. SHARED MEMORY: all packed tensors in torch shared memory — DataLoader
-     workers access same physical memory without per-worker copies.
-  3. MULTI-PROCESS LOADING: num_workers=2, pin_memory=True, prefetch_factor=2.
-     Workers reconstruct dense [N,F] tensors from sparse storage (~0.5ms)
-     while GPU trains on the current batch.
-  4. TRUE MINI-BATCHING: B sequences batched via disjoint graph union
-     (edge-index offsetting). GraphSAGE processes B*N nodes per call.
+  1. PRE-COMPUTE at init: features/labels in SPARSE PACKED format.
+  2. SHARED MEMORY: packed tensors in torch shared memory.
+  3. num_workers=0 with pin_memory=True (Windows-safe).
+  4. TRUE MINI-BATCHING: B sequences batched via disjoint graph union.
+  5. AMP: fp16 forward on Tensor Cores via torch.amp.autocast('cuda').
+  6. cudnn.benchmark=True for optimized convolution kernels.
 
-Memory design:
-  Dense [W, N, F] with W=8921, N=89484, F=13 would need 41.5 GB.
-  Sparse packed format stores only the 197K active (node, window) rows -> ~10 MB.
-  Workers reconstruct dense [N, F] tensors on-the-fly in __getitem__.
-
-FIX LOG (memory & performance):
-  - Vectorized _build_dynamic_edges with numpy
-  - LRU edge cache (200 windows), then pre-computation of all edges at init
-  - O(1) running confusion matrix vs O(N*sequences) list accumulation
-  - Feature normalization restricted to training windows (no test leakage)
-  - GPU-native edge builder -> pre-computed CPU edge builder (one-time cost)
-  - PIPELINE REDESIGN: sparse packed storage + DataLoader + mini-batching
-  - Auto-scaled batch_size: min(config, 400K / N) for 8 GB VRAM safety
-
-Optimized for RTX 4060 Mobile 8GB / 16GB RAM / Windows:
-  - Sparse packed tensors in shared memory (~10 MB vs 41.5 GB dense)
-  - 2 DataLoader workers with persistent_workers + prefetch
-  - Batch auto-scaling keeps VRAM under 7 GB
-  - Single gc.collect() + empty_cache() at epoch end
+FIX LOG:
+  - Removed torch.compile (Windows incompatible)
+  - Set num_workers=0 (prevents Error 1455 shared file mapping crash)
+  - Modern torch.amp namespace throughout
+  - non_blocking=True on all .to(device) calls
+  - Explicit gc.collect() + empty_cache() per epoch
+  - cudnn.benchmark=True for GPU kernel optimization
+  - Dynamic focal_alpha from metadata.json if available
+  - Auto-scaled batch_size capped at 2 for 8GB VRAM safety
 """
 
 import os
@@ -59,7 +51,7 @@ from model import SpatioTemporalGNN, FocalLoss
 
 
 # ============================================================================
-# 1. SequenceDataset — sparse packed, worker-safe, shared-memory backed
+# 1. SequenceDataset — sparse packed, shared-memory backed
 # ============================================================================
 
 class SequenceDataset(Dataset):
@@ -67,14 +59,8 @@ class SequenceDataset(Dataset):
     Returns graph sequences by reconstructing dense tensors from sparse
     packed shared-memory storage on-the-fly.
 
-    Sparse packed format:
-      Features: feat_values [total_active, F] + feat_nodes [total_active] int32
-                + feat_offsets [W+1] -> per-window slicing
-      Labels:   label_nodes [total_failing] int32 + label_offsets [W+1]
-      Edges:    all_edge_flat [2, total_E] + edge_offsets [W+1]
-
-    __getitem__ reconstructs dense [N, F] feature tensors (~0.5ms per window)
-    and applies normalization. No pandas, no dicts — pure tensor indexing.
+    Sparse packed format stores only active (node, window) entries -> ~10 MB
+    instead of dense [W, N, F] which would need 41.5 GB.
     """
 
     def __init__(self, feat_values, feat_nodes, feat_offsets,
@@ -82,42 +68,42 @@ class SequenceDataset(Dataset):
                  all_edge_flat, edge_offsets,
                  seq_starts, seq_length, num_nodes, num_features,
                  static_ei, feat_mean, feat_std,
-                 feat_values_norm=None, zero_normalized=None):
-        self.feat_values = feat_values      # [total_active, F] shared memory
-        self.feat_nodes = feat_nodes        # [total_active] int32 shared memory
-        self.feat_offsets = feat_offsets     # [W+1] shared memory
-        self.label_nodes = label_nodes      # [total_failing] int32 shared memory
-        self.label_offsets = label_offsets   # [W+1] shared memory
-        self.all_edge_flat = all_edge_flat  # [2, total_E] shared memory
-        self.edge_offsets = edge_offsets     # [W+1] shared memory
-        self.seq_starts = seq_starts        # list of int (window start indices)
+                 feat_values_norm=None, zero_normalized=None,
+                 device=None):
+        # Device for on-GPU tensor reconstruction (eliminates CPU bottleneck)
+        self.device = device if device is not None else torch.device('cpu')
+        self.feat_values = feat_values
+        self.feat_nodes = feat_nodes
+        self.feat_offsets = feat_offsets
+        self.label_nodes = label_nodes
+        self.label_offsets = label_offsets
+        self.all_edge_flat = all_edge_flat
+        self.edge_offsets = edge_offsets
+        self.seq_starts = seq_starts
         self.seq_length = seq_length
         self.num_nodes = num_nodes
         self.num_features = num_features
-        self.static_ei = static_ei          # [2, E_static] CPU tensor (fallback)
-        self.feat_mean = feat_mean          # [F] tensor
-        self.feat_std = feat_std            # [F] tensor
-        self.feat_values_norm = feat_values_norm  # [total_active, F] pre-normalized
-        self.zero_normalized = zero_normalized    # [F] background for inactive nodes
+        self.static_ei = static_ei
+        self.feat_mean = feat_mean
+        self.feat_std = feat_std
+        self.feat_values_norm = feat_values_norm
+        self.zero_normalized = zero_normalized
 
     def __len__(self):
         return len(self.seq_starts)
 
     def _get_features(self, w):
-        """Reconstruct dense [N, F] tensor from sparse packed storage."""
+        """Reconstruct dense [N, F] tensor from sparse packed storage on device."""
         start = int(self.feat_offsets[w])
-        end   = int(self.feat_offsets[w + 1])
+        end = int(self.feat_offsets[w + 1])
         if self.feat_values_norm is not None and self.zero_normalized is not None:
-            # Fast path: values are pre-normalized; background fill via broadcast
-            # avoids per-element sub/div on the full [N, F] tensor each call.
-            x = torch.empty(self.num_nodes, self.num_features)
-            x[:] = self.zero_normalized          # broadcast [F] -> [N, F]
+            x = torch.empty(self.num_nodes, self.num_features, device=self.device)
+            x[:] = self.zero_normalized
             if end > start:
                 nodes = self.feat_nodes[start:end].long()
                 x[nodes] = self.feat_values_norm[start:end]
         else:
-            # Fallback: allocate zeros, scatter, then normalize full tensor
-            x = torch.zeros(self.num_nodes, self.num_features)
+            x = torch.zeros(self.num_nodes, self.num_features, device=self.device)
             if end > start:
                 nodes = self.feat_nodes[start:end].long()
                 x[nodes] = self.feat_values[start:end]
@@ -125,10 +111,10 @@ class SequenceDataset(Dataset):
         return x
 
     def _get_labels(self, w):
-        """Reconstruct dense [N] label tensor from sparse packed storage."""
+        """Reconstruct dense [N] label tensor from sparse packed storage on device."""
         start = int(self.label_offsets[w])
         end = int(self.label_offsets[w + 1])
-        y = torch.zeros(self.num_nodes, dtype=torch.long)
+        y = torch.zeros(self.num_nodes, dtype=torch.long, device=self.device)
         if end > start:
             nodes = self.label_nodes[start:end].long()
             y[nodes] = 1
@@ -138,13 +124,9 @@ class SequenceDataset(Dataset):
         start = self.seq_starts[idx]
         w_indices = list(range(start, start + self.seq_length))
 
-        # Features: reconstruct + normalize per window
         x_list = [self._get_features(w) for w in w_indices]
-
-        # Labels from the last window of the sequence
         y = self._get_labels(w_indices[-1])
 
-        # Edges: slices from packed shared-memory tensor
         edge_list = [
             self.all_edge_flat[
                 :, int(self.edge_offsets[w]):int(self.edge_offsets[w + 1])]
@@ -155,7 +137,7 @@ class SequenceDataset(Dataset):
 
 
 # ============================================================================
-# 2. Collate — batches B sequences into one disjoint-union graph per timestep
+# 2. Collate — batches B sequences into disjoint-union graphs per timestep
 # ============================================================================
 
 def collate_graph_sequences(batch):
@@ -166,9 +148,8 @@ def collate_graph_sequences(batch):
       - Cat B copies of [N, F] features -> [B*N, F]
       - Offset each graph's edges by b*N and cat -> [2, sum(E_b)]
 
-    This creates B disconnected sub-graphs of N nodes. GraphSAGE
-    processes all B*N nodes in one call — O(B) better GPU utilization
-    than sequential per-sequence processing.
+    Creates B disconnected sub-graphs. GraphSAGE processes all B*N nodes
+    in one call — O(B) better GPU utilization than sequential processing.
     """
     B = len(batch)
     T = len(batch[0][0])
@@ -178,10 +159,8 @@ def collate_graph_sequences(batch):
     batched_edges = []
 
     for t in range(T):
-        # Concatenate features: [B*N, F]
         x_t = torch.cat([batch[b][0][t] for b in range(B)], dim=0)
 
-        # Offset and concatenate edges: [2, sum(E_b)]
         edge_parts = []
         for b in range(B):
             ei = batch[b][2][t]
@@ -191,14 +170,13 @@ def collate_graph_sequences(batch):
         batched_x.append(x_t)
         batched_edges.append(e_t)
 
-    # Concatenate labels from last timestep: [B*N]
     y = torch.cat([batch[b][1] for b in range(B)], dim=0)
 
     return batched_x, y, batched_edges, B
 
 
 # ============================================================================
-# 3. DynamicGraphLoader — loads data, pre-computes into sparse packed tensors
+# 3. DynamicGraphLoader — loads data, pre-computes sparse packed tensors
 # ============================================================================
 
 class DynamicGraphLoader:
@@ -206,16 +184,7 @@ class DynamicGraphLoader:
     Loads Borg trace data and pre-computes ALL features, labels, and
     edge indices into SPARSE PACKED CPU shared-memory tensors at init time.
 
-    Why sparse?
-      Dense [W=8921, N=89484, F=13] = 41.5 GB — impossible on 16 GB RAM.
-      Only 197K of 10.4B possible (node, window) pairs have data (0.02%).
-      Sparse packed format: ~10 MB total.
-
-    Pre-computation breakdown:
-      - Features: feat_values [total_active, F] + feat_nodes [total_active]
-                  + feat_offsets [W+1]
-      - Labels:   label_nodes [total_failing] + label_offsets [W+1]
-      - Edges:    all_edge_flat [2, total_E] + edge_offsets [W+1]
+    Sparse packed format: ~10 MB total vs 41.5 GB dense.
     """
 
     def __init__(self, processed_dir="processed", seq_length=6):
@@ -245,12 +214,9 @@ class DynamicGraphLoader:
         labels_df["machine_id"] = labels_df["machine_id"].astype(str)
 
         self.time_windows = sorted(features_df["time_window"].unique())
-        tw_to_widx = {tw: i for i, tw in enumerate(self.time_windows)}
         W = len(self.time_windows)
 
         # === PRE-COMPUTE FEATURES -> sparse packed format ===
-        # Dense [W, N, F] would be 41.5 GB — impossible on 16 GB RAM.
-        # Sparse packed stores only active (node, window) entries -> ~10 MB.
         print("  Pre-computing feature tensors (sparse packed)...")
         t0 = time.time()
         feat_groups = dict(list(features_df.groupby("time_window")))
@@ -306,7 +272,6 @@ class DynamicGraphLoader:
                 idx_map = df["machine_id"].map(self.m2i)
                 valid = idx_map.notna()
                 if valid.any():
-                    # Only store nodes where label == 1 (failing)
                     label_vals = df.loc[valid.values, "label"].values
                     nidx_all = idx_map[valid].astype(int).values
                     failing_mask = (label_vals == 1)
@@ -352,7 +317,7 @@ class DynamicGraphLoader:
                         else self.static_ei_cpu.clone())
                 else:
                     edge_list.append(self.static_ei_cpu.clone())
-                if (i + 1) % 100 == 0 or (i + 1) == W:
+                if (i + 1) % 500 == 0 or (i + 1) == W:
                     elapsed = time.time() - t0
                     eta = elapsed / (i + 1) * (W - i - 1)
                     print(f"    [{i+1}/{W}] windows ({elapsed:.0f}s elapsed, "
@@ -363,7 +328,7 @@ class DynamicGraphLoader:
             print("  Dynamic edges: DISABLED (using static graph)")
             edge_list = [self.static_ei_cpu.clone() for _ in range(W)]
 
-        # Free source DataFrames — no longer needed
+        # Free source DataFrames
         del features_df, labels_df
         gc.collect()
 
@@ -415,13 +380,8 @@ class DynamicGraphLoader:
 
     def _build_edges_for_window(self, tw_df):
         """
-        Build edge_index using np.argsort-based grouping — no pandas groupby.
-
-        pandas groupby() builds a Python dict + DataFrameGroupBy object per
-        call, adding ~0.5ms overhead × 8921 windows = ~4s of pure Python tax
-        before any numpy work starts. np.argsort replaces that with a single
-        C-level sort, cutting init time by ~3x.
-        Used during pre-computation ONLY (not on the training hot path).
+        Build edge_index using np.argsort-based grouping (vectorized).
+        No pandas groupby — uses C-level sort for ~3x faster init.
         """
         all_src, all_dst = [], []
         node_arr = tw_df["_node_idx"].values.astype(np.int64)
@@ -431,7 +391,6 @@ class DynamicGraphLoader:
             order = np.argsort(grp_vals, kind="stable")
             nodes_s = node_arr[order]
             grp_s = grp_vals[order]
-            # Locate group boundaries in one C-level pass
             bounds = np.flatnonzero(grp_s[1:] != grp_s[:-1]) + 1
             starts = np.concatenate([[0], bounds])
             ends = np.concatenate([bounds, [len(nodes_s)]])
@@ -461,7 +420,6 @@ class DynamicGraphLoader:
         if "collection_id" in tw_df.columns:
             _edges_from_col("collection_id", thresh=40, K_max=10)
 
-        # Self-loops for all active nodes
         active_all = np.unique(node_arr)
         if len(active_all) > 0:
             all_src.append(active_all)
@@ -489,16 +447,15 @@ class DynamicGraphLoader:
     def compute_normalization(self, window_indices):
         """
         Compute feature normalization stats incrementally.
-        Uses O(F) memory instead of O(S*N*F) — safe for large graphs.
+        Uses O(F) memory instead of O(S*N*F).
         """
         sample_idx = np.random.choice(
             window_indices, min(100, len(window_indices)), replace=False)
-        # Incremental Welford-style computation
         sum_x = torch.zeros(self.num_features, dtype=torch.float64)
         sum_x2 = torch.zeros(self.num_features, dtype=torch.float64)
         count = 0
         for w in sample_idx:
-            x = self._reconstruct_features(int(w))  # [N, F]
+            x = self._reconstruct_features(int(w))
             sum_x += x.sum(dim=0).double()
             sum_x2 += (x ** 2).sum(dim=0).double()
             count += x.shape[0]
@@ -507,13 +464,13 @@ class DynamicGraphLoader:
         std[std < 1e-8] = 1.0
         return mean, std
 
-    def create_dataset(self, indices, feat_mean, feat_std):
+    def create_dataset(self, indices, feat_mean, feat_std, device=None):
         """Create a SequenceDataset for the given sequence indices."""
         seq_starts = [self.seq_starts[i] for i in indices]
-        # Pre-normalize the ~197K active entries ONCE here.
-        # Workers then do a fast broadcast fill instead of a full [N,F] sub/div.
         feat_values_norm = (self.feat_values - feat_mean) / feat_std
-        feat_values_norm.share_memory_()
+        # share_memory_ only works on CPU tensors (for multi-process DataLoader)
+        if feat_values_norm.device.type == 'cpu':
+            feat_values_norm.share_memory_()
         zero_normalized = (-feat_mean / feat_std).clone()
         return SequenceDataset(
             feat_values=self.feat_values,
@@ -532,6 +489,7 @@ class DynamicGraphLoader:
             feat_std=feat_std,
             feat_values_norm=feat_values_norm,
             zero_normalized=zero_normalized,
+            device=device,
         )
 
 
@@ -576,6 +534,7 @@ def train_epoch(model, dataloader, criterion, optimizer,
 
     Each batch contains B graph sequences batched into one disjoint-union
     graph of B*N nodes. One forward + backward pass per batch.
+    All .to(device) calls use non_blocking=True for async DMA transfers.
     """
     model.train()
     total_loss = 0.0
@@ -589,13 +548,14 @@ def train_epoch(model, dataloader, criterion, optimizer,
         edge_list = [e.to(device, non_blocking=True) for e in edge_list]
         y = y.to(device, non_blocking=True)
 
-        # Forward + backward (processes B*N nodes per call)
-        # AMP: fp16 forward on Tensor Cores → ~2x GPU throughput on RTX 4060
+        # Forward + backward
+        # AMP: fp16 forward on Tensor Cores -> ~2x GPU throughput on RTX 4060
         optimizer.zero_grad()
         use_amp = scaler is not None
         with torch.amp.autocast('cuda', enabled=use_amp):
             logits = model(x_list, edge_list, num_nodes=num_nodes * B)
             loss = criterion(logits, y)
+
         if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -621,8 +581,10 @@ def train_epoch(model, dataloader, criterion, optimizer,
         if (batch_idx + 1) % 10 == 0:
             print(f"    [{batch_idx+1}/{len(dataloader)}] batches", flush=True)
 
+        # Explicit cleanup to prevent memory leaks across batches
         del x_list, y, logits, loss, edge_list
 
+    # End-of-epoch cleanup
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -647,6 +609,7 @@ def evaluate(model, dataloader, criterion, device, num_nodes):
         with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
             logits = model(x_list, edge_list, num_nodes=num_nodes * B)
             loss = criterion(logits, y)
+
         total_loss += loss.item()
         num_batches += 1
 
@@ -678,30 +641,36 @@ def main():
         with open("config.yaml") as f:
             config = yaml.safe_load(f) or {}
 
-    # CUDA setup (inside main to avoid running in DataLoader workers)
+    # ---- CUDA setup ----
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        # Enable cuDNN benchmark for optimized convolution kernel selection.
+        # Safe here because input sizes are fixed across batches.
+        torch.backends.cudnn.benchmark = True
         print(f"Using device: cuda")
         print(f"GPU: {torch.cuda.get_device_name(0)} "
-              f"({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB)")
+              f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)")
         print(f"CUDA Version: {torch.version.cuda}")
+        print(f"cuDNN benchmark: ENABLED")
         torch.cuda.empty_cache()
     else:
         device = torch.device("cpu")
         print("Using device: cpu")
         print("WARNING: CUDA not available, training will be very slow")
 
+    # ---- Load data ----
     data_cfg = config.get("data", {})
     loader = DynamicGraphLoader(
         "processed",
         seq_length=data_cfg.get("sequence_length", 6),
     )
 
-    # Train/val/test split
+    # ---- Train/val/test split (0.70 / 0.15 / 0.15) ----
     n = len(loader)
-    tr_end = int(n * data_cfg.get("train_ratio", 0.7))
-    va_end = int(n * (data_cfg.get("train_ratio", 0.7) +
-                       data_cfg.get("val_ratio", 0.15)))
+    tr_ratio = data_cfg.get("train_ratio", 0.7)
+    va_ratio = data_cfg.get("val_ratio", 0.15)
+    tr_end = int(n * tr_ratio)
+    va_end = int(n * (tr_ratio + va_ratio))
     tr_idx = list(range(tr_end))
     va_idx = list(range(tr_end, va_end))
     te_idx = list(range(va_end, n))
@@ -718,46 +687,84 @@ def main():
     print("\nComputing feature normalization (training windows only)...")
     feat_mean, feat_std = loader.compute_normalization(train_tw_indices)
 
-    # Dynamic focal_alpha from training label distribution.
-    print("Computing class balance for dynamic focal alpha...")
-    _sample = tr_idx[:min(200, len(tr_idx))]
-    _fail, _total = 0, 0
-    for si in _sample:
-        start = loader.seq_starts[si]
-        tw_last = start + loader.seq_length - 1
-        # Read directly from packed labels (no tensor reconstruction needed)
-        l_start = int(loader.label_offsets[tw_last])
-        l_end = int(loader.label_offsets[tw_last + 1])
-        _fail += (l_end - l_start)
-        _total += loader.num_nodes
-    _pos_rate = _fail / max(_total, 1)
-    dynamic_alpha = float(max(0.5, min(0.95, 1.0 - _pos_rate)))
-    print(f"  Failure rate: {_pos_rate:.4f}  ->  focal_alpha={dynamic_alpha:.3f}")
+    # ---- Dynamic focal_alpha ----
+    # Try loading from metadata.json first (computed in preprocess.py)
+    train_cfg = config.get("training", {})
+    metadata_path = os.path.join("processed", "metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        dynamic_alpha = metadata.get("recommended_focal_alpha",
+                                      train_cfg.get("focal_alpha", 0.99))
+        print(f"  Focal alpha from metadata.json: {dynamic_alpha:.3f} "
+              f"(failure_ratio={metadata.get('failure_ratio', 'N/A')})")
+    else:
+        # Fallback: compute from training labels
+        print("  Computing class balance for dynamic focal alpha...")
+        _sample = tr_idx[:min(200, len(tr_idx))]
+        _fail, _total = 0, 0
+        for si in _sample:
+            start = loader.seq_starts[si]
+            tw_last = start + loader.seq_length - 1
+            l_start = int(loader.label_offsets[tw_last])
+            l_end = int(loader.label_offsets[tw_last + 1])
+            _fail += (l_end - l_start)
+            _total += loader.num_nodes
+        _pos_rate = _fail / max(_total, 1)
+        dynamic_alpha = float(max(0.5, min(0.99, 1.0 - _pos_rate)))
+        print(f"  Failure rate: {_pos_rate:.6f} -> focal_alpha={dynamic_alpha:.3f}")
 
-    # Create datasets
-    tr_dataset = loader.create_dataset(tr_idx, feat_mean, feat_std)
-    va_dataset = loader.create_dataset(va_idx, feat_mean, feat_std)
-    te_dataset = (loader.create_dataset(te_idx, feat_mean, feat_std)
+    # Override with config if explicitly set
+    focal_alpha = train_cfg.get("focal_alpha", dynamic_alpha)
+    focal_gamma = train_cfg.get("focal_gamma", 3.0)
+
+    # ---- Move sparse data to GPU for on-device reconstruction ----
+    # ROOT CAUSE FIX: With num_workers=0, DataLoader reconstructs dense [N,F]
+    # tensors from sparse format ON CPU in the main thread. The tiny model
+    # (hidden=32) finishes GPU forward/backward in ms, but CPU spends seconds
+    # on dense reconstruction -> GPU sits idle at 1W.
+    # FIX: Move sparse packed data (~10 MB) to GPU. Scatter-based reconstruction
+    # now runs on GPU (massively parallel) -> GPU stays busy.
+    if device.type == 'cuda':
+        print(f"\n  Moving sparse packed data to GPU for on-device reconstruction...")
+        loader.feat_values = loader.feat_values.to(device)
+        loader.feat_nodes = loader.feat_nodes.to(device)
+        loader.label_nodes = loader.label_nodes.to(device)
+        loader.all_edge_flat = loader.all_edge_flat.to(device)
+        loader.static_ei_cpu = loader.static_ei_cpu.to(device)
+        feat_mean = feat_mean.to(device)
+        feat_std = feat_std.to(device)
+        _alloc_mb = torch.cuda.memory_allocated() / 1024**2
+        print(f"  GPU memory after data load: {_alloc_mb:.0f} MB")
+
+    # ---- Create datasets ----
+    tr_dataset = loader.create_dataset(tr_idx, feat_mean, feat_std, device=device)
+    va_dataset = loader.create_dataset(va_idx, feat_mean, feat_std, device=device)
+    te_dataset = (loader.create_dataset(te_idx, feat_mean, feat_std, device=device)
                   if te_idx else None)
 
-    # Auto-scale batch_size for 8 GB VRAM safety.
-    # With true mini-batching, each batch has B*N nodes through GraphSAGE+GRU.
-    # Memory per node ≈ hidden*4 * T * layers * 2(fwd+grad) ≈ 12 KB for typical config.
-    # Target: keep total activation memory under ~6 GB.
-    _cfg_batch = config.get("training", {}).get("batch_size", 16)
-    batch_size = max(1, min(_cfg_batch, 400_000 // max(loader.num_nodes, 1)))
-    num_workers = 0  # Windows: num_workers>0 triggers Error 1455 (shared memory)
+    # ---- DataLoader setup ----
+    # HARD LIMITS from CLAUDE.md:
+    #   batch_size <= 2  (OOM on 8GB VRAM if higher)
+    #   num_workers = 0  (Error 1455 on Windows if higher)
+    _cfg_batch = train_cfg.get("batch_size", 2)
+    batch_size = max(1, min(_cfg_batch, 2))  # HARD CAP at 2
+    num_workers = 0  # HARD: Windows Error 1455 with num_workers > 0
 
+    _pin = device.type != 'cuda'
     print(f"\n  DataLoader: batch_size={batch_size}, workers={num_workers}, "
-          f"pin_memory=True, prefetch=2")
+          f"pin_memory={_pin}")
     print(f"  Nodes per batch: ~{batch_size * loader.num_nodes:,}")
+    if device.type == 'cuda':
+        print(f"  Data reconstruction: ON GPU (eliminates CPU bottleneck)")
 
+    # pin_memory only useful for CPU->GPU DMA. With on-device reconstruction,
+    # data is already on GPU — pinning CUDA tensors raises an error.
     dl_kwargs = dict(
         collate_fn=collate_graph_sequences,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        pin_memory=_pin,
+        # persistent_workers and prefetch_factor only valid with num_workers>0
     )
 
     tr_loader = DataLoader(
@@ -768,56 +775,47 @@ def main():
         te_dataset, batch_size=batch_size * 2, shuffle=False, **dl_kwargs)
         if te_dataset else None)
 
-    # Model
+    # ---- Model ----
     model_cfg = config.get("model", {})
-    hidden = model_cfg.get("hidden_dim", 48)
+    hidden = min(model_cfg.get("hidden_dim", 32), 32)  # HARD CAP at 32
 
     model = SpatioTemporalGNN(
         input_dim=loader.num_features,
         hidden_dim=hidden,
         num_gnn_layers=model_cfg.get("num_gnn_layers", 2),
         dropout=model_cfg.get("dropout", 0.3),
-        edge_drop_rate=0.3,
+        edge_drop_rate=model_cfg.get("edge_drop_rate", 0.3),
     ).to(device)
 
-    # torch.compile disabled on Windows (Triton not supported)
-    if hasattr(torch, 'compile') and device.type == 'cuda' \
-            and sys.platform != 'win32':
-        try:
-            model = torch.compile(model)
-            print("  torch.compile: ENABLED (kernel fusion active)")
-        except Exception:
-            print("  torch.compile: skipped")
-    elif sys.platform == 'win32':
-        print("  torch.compile: DISABLED (Windows — using eager mode)")
+    # torch.compile DISABLED on Windows (Triton not supported)
+    # Do NOT attempt torch.compile on any platform to avoid issues.
+    print("  torch.compile: DISABLED (Windows — Triton not supported)")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: {n_params:,} parameters")
-    print(f"  Spatial: 2-layer GraphSAGE (hidden={hidden}, edge_drop=0.3)")
-    print(f"  Temporal: GRU (hidden={hidden})")
+    print(f"  Spatial: 2-layer GraphSAGE (hidden={hidden}, "
+          f"edge_drop={model_cfg.get('edge_drop_rate', 0.3)})")
+    print(f"  Temporal: GRU (hidden={hidden}) + attention pooling")
     print(f"  Graph: {'DYNAMIC per-window' if loader.dynamic else 'static'}")
 
-    # Training setup
-    train_cfg = config.get("training", {})
-    # Mixed-precision scaler: fp16 forward on RTX 4060 Tensor Cores → ~2x GPU
-    # throughput. GradScaler prevents fp16 underflow in backward pass.
+    # ---- Training setup ----
+    # AMP: modern torch.amp namespace (not deprecated torch.cuda.amp)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     if scaler is not None:
-        print("  AMP: ENABLED (fp16 autocast + GradScaler)")
+        print("  AMP: ENABLED (torch.amp.autocast + GradScaler)")
     else:
         print("  AMP: DISABLED (CPU mode)")
 
-    criterion = FocalLoss(
-        alpha=train_cfg.get("focal_alpha", 0.99),
-        gamma=train_cfg.get("focal_gamma", 3.0),
-    )
+    criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    print(f"  Loss: FocalLoss(alpha={focal_alpha:.3f}, gamma={focal_gamma:.1f})")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg.get("learning_rate", 0.001),
         weight_decay=train_cfg.get("weight_decay", 1e-4),
     )
-    epochs = train_cfg.get("epochs", 30)
-    patience = train_cfg.get("early_stopping_patience", 10)
+    epochs = train_cfg.get("epochs", 10)
+    patience = train_cfg.get("early_stopping_patience", 5)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -829,6 +827,11 @@ def main():
     print("\n" + "=" * 65)
     print("TRAINING")
     print("=" * 65)
+    print(f"  Epochs: {epochs}")
+    print(f"  Early stopping patience: {patience}")
+    print(f"  Gradient clip: {train_cfg.get('gradient_clip', 1.0)}")
+
+    train_start = time.time()
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -846,9 +849,11 @@ def main():
         scheduler.step()
         lr = optimizer.param_groups[0]["lr"]
 
-        print(f"  Train — loss: {tr_loss:.4f}  F1: {tr_m['f1']:.4f}")
+        print(f"  Train — loss: {tr_loss:.4f}  F1: {tr_m['f1']:.4f}  "
+              f"Prec: {tr_m['prec']:.4f}  Rec: {tr_m['rec']:.4f}")
         print(f"  Val   — loss: {va_loss:.4f}  F1: {va_m.get('f1',0):.4f}  "
-              f"AUROC: {va_m.get('auroc',0):.4f}  Recall: {va_m.get('rec',0):.4f}  "
+              f"AUROC: {va_m.get('auroc',0):.4f}  "
+              f"Rec: {va_m.get('rec',0):.4f}  "
               f"[{elapsed:.0f}s, lr={lr:.6f}]")
 
         if va_m.get("f1", 0) > best_f1:
@@ -861,14 +866,14 @@ def main():
                 "input_dim": loader.num_features,
                 "hidden_dim": hidden,
                 "num_gnn_layers": model_cfg.get("num_gnn_layers", 2),
-                "num_neighbors": model_cfg.get("num_neighbors", 15),
                 "dropout": model_cfg.get("dropout", 0.3),
-                "edge_drop_rate": 0.3,
+                "edge_drop_rate": model_cfg.get("edge_drop_rate", 0.3),
                 "feat_mean": feat_mean,
                 "feat_std": feat_std,
                 "num_nodes": loader.num_nodes,
                 "dynamic_edges": loader.dynamic,
-                "focal_alpha": train_cfg.get("focal_alpha", 0.99),
+                "focal_alpha": focal_alpha,
+                "focal_gamma": focal_gamma,
                 "val_f1": best_f1,
                 "val_metrics": va_m,
             }, "best_model.pt")
@@ -876,14 +881,18 @@ def main():
         else:
             patience_ctr += 1
             if patience_ctr >= patience:
-                print(f"\n  Early stopping — best F1: {best_f1:.4f}")
+                print(f"\n  Early stopping at epoch {epoch} — best F1: {best_f1:.4f}")
                 break
 
+        # Per-epoch memory cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Test evaluation
+    total_train_time = time.time() - train_start
+    print(f"\n  Total training time: {total_train_time / 60:.1f} minutes")
+
+    # ---- Test evaluation ----
     if te_loader:
         print("\n" + "=" * 65)
         print("TEST EVALUATION")
@@ -906,11 +915,13 @@ def main():
                 target_names=["Normal", "Failing"], zero_division=0
             ))
 
+        os.makedirs("processed", exist_ok=True)
         np.savez("processed/test_results.npz",
                  preds=te_preds, labels=te_labels, probs=te_probs)
         print("  Saved: processed/test_results.npz")
 
-    print(f"\n Done! Run: python evaluate.py")
+    print(f"\n  Done! Total time: {(time.time() - train_start) / 60:.1f} min")
+    print(f"  Next: python evaluate.py")
 
 
 if __name__ == "__main__":

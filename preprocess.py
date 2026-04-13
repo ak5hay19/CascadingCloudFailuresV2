@@ -3,14 +3,20 @@ STEP 1: Preprocess Borg Traces
 ================================
     python preprocess.py
 
-Reads borg_traces_data.csv → cleans → engineers features →
-builds static adjacency + per-window membership data → saves to ./processed/
+Reads borg_traces_data.csv -> cleans -> engineers features ->
+builds static adjacency + per-window membership data -> saves to ./processed/
 
 Output files:
-  processed/machine_features.parquet  — (machine_id, time_window, 13 features)
-  processed/failure_labels.parquet    — (machine_id, time_window) pairs about to fail
-  processed/adjacency.json            — static graph edges + node mapping (fallback)
-  processed/window_membership.parquet — per-window cluster/collection membership (for dynamic edges)
+  processed/machine_features.parquet  -- (machine_id, time_window, 13 features)
+  processed/failure_labels.parquet    -- (machine_id, time_window) pairs about to fail
+  processed/adjacency.json           -- static graph edges + node mapping (fallback)
+  processed/window_membership.parquet -- per-window cluster/collection membership
+  processed/metadata.json            -- global stats incl. failure ratio
+
+Optimizations:
+  - All feature columns downcast to float32 to save VRAM/RAM
+  - Adjacency building uses vectorized NumPy (no nested Python loops)
+  - Metadata includes global failure ratio for dynamic focal_alpha
 """
 
 import os
@@ -58,11 +64,14 @@ def load_data(filename):
 
 def clean_data(df):
     print("Cleaning data...")
-    for col in ["time", "priority", "instance_index", "start_time", "end_time",
-                 "average_usage", "maximum_usage", "random_sample_usage",
-                 "assigned_memory", "page_cache_memory",
-                 "cycles_per_instruction", "memory_accesses_per_instruction",
-                 "sample_rate"]:
+    numeric_cols = [
+        "time", "priority", "instance_index", "start_time", "end_time",
+        "average_usage", "maximum_usage", "random_sample_usage",
+        "assigned_memory", "page_cache_memory",
+        "cycles_per_instruction", "memory_accesses_per_instruction",
+        "sample_rate",
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -106,6 +115,7 @@ def add_time_windows(df, window_sec=300):
 
 
 def build_features(df):
+    """Build machine-level features, downcast to float32 for VRAM savings."""
     print("Building machine-level features...")
     agg = {}
     if "average_usage" in df.columns:
@@ -132,9 +142,14 @@ def build_features(df):
     grouped.columns = ["_".join(col).strip("_") for col in grouped.columns]
     grouped = grouped.reset_index().fillna(0)
 
+    # Downcast all feature columns to float32 to save VRAM/RAM
     feat_cols = [c for c in grouped.columns if c not in ("machine_id", "time_window")]
+    for col in feat_cols:
+        grouped[col] = grouped[col].astype(np.float32)
+
     print(f"  {grouped.shape[0]:,} (machine, window) pairs")
     print(f"  {len(feat_cols)} features: {feat_cols}")
+    print(f"  All features downcast to float32")
     return grouped
 
 
@@ -171,65 +186,97 @@ def build_labels(df, horizon=3):
     return labels
 
 
-def build_static_adjacency(df):
-    """Build static adjacency (used as fallback and for eval)."""
-    print("Building static adjacency graph...")
+def build_static_adjacency_vectorized(df):
+    """
+    Build static adjacency using vectorized NumPy operations.
+    Avoids nested Python loops for edge construction.
+    """
+    print("Building static adjacency graph (vectorized)...")
 
     machines = df["machine_id"].unique()
     machine_to_idx = {m: i for i, m in enumerate(sorted(machines))}
-    print(f"  {len(machine_to_idx)} nodes")
+    num_nodes = len(machine_to_idx)
+    print(f"  {num_nodes} nodes")
 
-    edges = {}
+    all_src = []
+    all_dst = []
+    all_wgt = []
+
+    def _add_edges_vectorized(groups_series, k_max, weight):
+        """Vectorized edge building for a groupby result."""
+        for _, m_set in groups_series.items():
+            m_list = np.array([machine_to_idx[m] for m in m_set if m in machine_to_idx],
+                              dtype=np.int64)
+            na = len(m_list)
+            if na < 2:
+                continue
+            if na <= k_max * 2:
+                # Small group: full pairwise (vectorized)
+                ii, jj = np.triu_indices(na, k=1)
+                src = m_list[ii]
+                dst = m_list[jj]
+            else:
+                # Large group: k-nearest neighbors by index (vectorized)
+                K = min(k_max, na - 1)
+                pos = np.arange(na)
+                j_idx = pos[:, None] + np.arange(1, K + 1)[None, :]
+                valid = j_idx < na
+                i_val = np.broadcast_to(pos[:, None], (na, K))[valid]
+                j_val = j_idx[valid]
+                src = m_list[i_val]
+                dst = m_list[j_val]
+
+            # Bidirectional
+            all_src.append(src)
+            all_src.append(dst)
+            all_dst.append(dst)
+            all_dst.append(src)
+            all_wgt.append(np.full(len(src) * 2, weight, dtype=np.float32))
 
     if "cluster" in df.columns:
         cluster_groups = (
             df[df["machine_id"].isin(machine_to_idx)]
             .groupby("cluster")["machine_id"].apply(set)
         )
-        for _, m_set in cluster_groups.items():
-            m_list = [machine_to_idx[m] for m in m_set if m in machine_to_idx]
-            for i in range(len(m_list)):
-                for j in range(i + 1, min(i + 20, len(m_list))):
-                    edges[(m_list[i], m_list[j])] = 1.0
-                    edges[(m_list[j], m_list[i])] = 1.0
-        print(f"  Cluster edges: {len(edges)}")
+        _add_edges_vectorized(cluster_groups, k_max=20, weight=1.0)
+        print(f"  Cluster edges added")
 
     if "collection_id" in df.columns:
         coll_groups = (
             df[df["machine_id"].isin(machine_to_idx)]
             .groupby("collection_id")["machine_id"].apply(set)
         )
-        for _, m_set in coll_groups.items():
-            m_list = [machine_to_idx[m] for m in m_set if m in machine_to_idx]
-            for i in range(len(m_list)):
-                for j in range(i + 1, min(i + 10, len(m_list))):
-                    key = (m_list[i], m_list[j])
-                    if key not in edges:
-                        edges[key] = 0.5
-                    key_r = (m_list[j], m_list[i])
-                    if key_r not in edges:
-                        edges[key_r] = 0.5
-        print(f"  + Collection edges -> {len(edges)} total")
+        _add_edges_vectorized(coll_groups, k_max=10, weight=0.5)
+        print(f"  Collection edges added")
 
-    for i in range(len(machine_to_idx)):
-        edges[(i, i)] = 1.0
+    # Self-loops
+    self_nodes = np.arange(num_nodes, dtype=np.int64)
+    all_src.append(self_nodes)
+    all_dst.append(self_nodes)
+    all_wgt.append(np.ones(num_nodes, dtype=np.float32))
 
-    edge_list = sorted(edges.keys())
-    edge_weights = [edges[e] for e in edge_list]
+    # Concatenate and deduplicate
+    src = np.concatenate(all_src)
+    dst = np.concatenate(all_dst)
+    edges = np.stack([src, dst], axis=0)
+
+    # Deduplicate edges (keep first occurrence)
+    _, unique_idx = np.unique(edges, axis=1, return_index=True)
+    unique_idx.sort()
+    edges = edges[:, unique_idx]
+    wgt = np.concatenate(all_wgt)[unique_idx]
+
+    edge_list = edges.T.tolist()  # [[src, dst], ...]
+    edge_weights = wgt.tolist()
+
     print(f"  Final: {len(edge_list)} edges (incl self-loops)")
-
-    return machine_to_idx, [[e[0], e[1]] for e in edge_list], edge_weights
+    return machine_to_idx, edge_list, edge_weights
 
 
 def build_window_membership(df):
     """
     Save per-window cluster/collection membership for dynamic edge building.
-
-    Instead of building all per-window edge lists during preprocessing
-    (which would be a huge file), we save the compact membership data
-    and let the data loader build edges on-the-fly per window.
-
-    This is ~20MB vs ~500MB+ for pre-built per-window edge lists.
+    Compact format (~20MB) vs pre-built edge lists (~500MB+).
     """
     print("Building per-window membership data for dynamic edges...")
 
@@ -247,6 +294,29 @@ def build_window_membership(df):
 
     print(f"  {len(membership):,} membership records")
     return membership
+
+
+def compute_metadata(features, labels):
+    """Compute global statistics including failure ratio for dynamic focal_alpha."""
+    total_pairs = features[["machine_id", "time_window"]].drop_duplicates().shape[0]
+    num_positive = len(labels)
+    failure_ratio = num_positive / max(total_pairs, 1)
+
+    # Dynamic focal_alpha: higher alpha = more weight on rare failures
+    # For ~0.0001 failure rate, alpha should be ~0.99
+    dynamic_alpha = float(max(0.5, min(0.99, 1.0 - failure_ratio)))
+
+    metadata = {
+        "total_machine_window_pairs": int(total_pairs),
+        "num_positive_labels": int(num_positive),
+        "failure_ratio": float(failure_ratio),
+        "recommended_focal_alpha": dynamic_alpha,
+        "num_machines": int(features["machine_id"].nunique()),
+        "num_time_windows": int(features["time_window"].nunique()),
+        "num_features": int(len([c for c in features.columns
+                                  if c not in ("machine_id", "time_window")])),
+    }
+    return metadata
 
 
 def main():
@@ -271,8 +341,9 @@ def main():
 
     features = build_features(df)
     labels = build_labels(df, horizon)
-    machine_to_idx, edge_list, edge_weights = build_static_adjacency(df)
+    machine_to_idx, edge_list, edge_weights = build_static_adjacency_vectorized(df)
     membership = build_window_membership(df)
+    metadata = compute_metadata(features, labels)
 
     # Save
     os.makedirs("processed", exist_ok=True)
@@ -289,19 +360,26 @@ def main():
             "num_nodes": len(machine_to_idx),
         }, f)
 
+    with open("processed/metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
     feat_cols = [c for c in features.columns if c not in ("machine_id", "time_window")]
-    total = features[["machine_id", "time_window"]].drop_duplicates().shape[0]
 
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  Nodes (machines):    {len(machine_to_idx):,}")
-    print(f"  Time windows:        {features['time_window'].nunique():,}")
-    print(f"  Features per node:   {len(feat_cols)}")
+    print(f"  Nodes (machines):    {metadata['num_machines']:,}")
+    print(f"  Time windows:        {metadata['num_time_windows']:,}")
+    print(f"  Features per node:   {metadata['num_features']}")
     print(f"  Static edges:        {len(edge_list):,}")
     print(f"  Membership records:  {len(membership):,} (for dynamic edges)")
-    print(f"  Positive labels:     {len(labels):,} / {total:,} ({100*len(labels)/max(total,1):.2f}%)")
+    print(f"  Positive labels:     {metadata['num_positive_labels']:,} / "
+          f"{metadata['total_machine_window_pairs']:,} "
+          f"({100*metadata['failure_ratio']:.4f}%)")
+    print(f"  Failure ratio:       {metadata['failure_ratio']:.6f}")
+    print(f"  Recommended alpha:   {metadata['recommended_focal_alpha']:.3f}")
     print(f"\n  Saved to ./processed/")
+    print(f"  Metadata: ./processed/metadata.json")
     print(f"  Next: python train.py")
 
 

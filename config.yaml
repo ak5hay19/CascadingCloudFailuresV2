@@ -1,34 +1,29 @@
-# ============================================================
-# Configuration — Dynamic GraphSAGE on Full Borg Trace
-# RTX 4060 Mobile (8GB VRAM) / 16GB RAM / Ryzen 9 8945HS
-# ============================================================
+# config.yaml — ST-GNN for Cascading Cloud Failures
+# Hardware: RTX 4060 Mobile 8GB / 16GB RAM / Windows 11
+# CRITICAL: Do NOT exceed batch_size: 2 or hidden_dim: 32 (OOM on 8GB VRAM)
 
 data:
   filename: "borg_traces_half.csv"
-  time_window_sec: 300          # 5-minute buckets
-  prediction_horizon: 3         # predict 15 min ahead
-  sequence_length: 8            # 40 min of history
-  train_ratio: 0.4              # orignal was 0.7 
-  val_ratio: 0.1                # og both were 0.15
-  test_ratio: 0.1
+  time_window_sec: 300          # 5-minute windows
+  prediction_horizon: 3         # predict 15 minutes ahead
+  sequence_length: 6            # 6 windows = 30 min history
+  train_ratio: 0.70
+  val_ratio: 0.15
+  # test = 1 - 0.70 - 0.15 = 0.15
 
 model:
-  hidden_dim: 32
-  num_gnn_layers: 2             # 2-layer GraphSAGE for 2-hop neighborhoods
+  hidden_dim: 32                # HARD LIMIT — 48 causes OOM
+  num_gnn_layers: 2             # 2-hop for cascade detection
   dropout: 0.3
-  num_neighbors: 15             # sample 15 neighbors per node per layer
+  edge_drop_rate: 0.3           # graph-structure regularization
 
 training:
-  epochs: 15                   # og 30 epochs
-  batch_size: 2               # og 8 batches
+  batch_size: 2                 # HARD LIMIT — higher causes OOM
+  epochs: 10                    # fits 30-60 min window
   learning_rate: 0.001
   weight_decay: 0.0001
-  early_stopping_patience: 10
   gradient_clip: 1.0
-  focal_alpha: 0.99
-  focal_gamma: 3.0
-
-evaluate:
-  top_k_critical: 20
-  tsne_samples: 2000
-  max_vis_nodes: 120
+  early_stopping_patience: 5
+  focal_alpha: 0.99             # extreme imbalance (~0.0001 failure rate)
+  focal_gamma: 3.0              # aggressive down-weight of easy negatives
+  num_workers: 0                # HARD LIMIT — >1 causes Error 1455 on Windows
