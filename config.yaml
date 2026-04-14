@@ -1,0 +1,42 @@
+# config.yaml — ST-GNN V6 (Real Features, ~70% positive rate)
+# Hardware: RTX 4060 Mobile 8GB / 16GB RAM / Windows 11
+#
+# KEY INSIGHT: With fixed preprocessing, failure rate is 70.5% (NOT 0.01%).
+# This is a mildly imbalanced problem favoring the POSITIVE class.
+# No extreme weighting needed — standard focal loss works.
+
+data:
+  filename: "borg_traces_half.csv"
+  time_window_sec: 300
+  prediction_horizon: 3
+  sequence_length: 6
+  train_ratio: 0.70
+  val_ratio: 0.15
+
+model:
+  hidden_dim: 40               # up from 32, conservative vs 48 (VRAM safety)
+  num_gnn_layers: 2             # 2-hop sufficient for cascade detection
+  dropout: 0.3
+  edge_drop_rate: 0.2
+  label_smoothing: 0.05         # light smoothing — prevents overconfidence
+
+training:
+  batch_size: 2                 # HARD LIMIT
+  epochs: 10                    # thermal ceiling
+  learning_rate: 0.002          # OneCycleLR peak
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  early_stopping_patience: 5
+  num_workers: 0                # HARD LIMIT — Error 1455 on Windows
+
+  # With 70.5% positive rate, the NORMAL class is the minority.
+  # alpha=0.3 gives 30% weight to positives, 70% to negatives — rebalances.
+  focal_alpha: 0.3
+  focal_gamma: 2.0
+
+  # No balanced sampling needed — natural ratio is fine at ~70/30.
+  # Set neg_ratio high enough that the full batch is used.
+  use_balanced_sampling: false
+
+  eval_threshold: 0.32           # standard argmax — should work with real features
+
